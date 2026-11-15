@@ -12,11 +12,10 @@ buffer to HTML via an external processor (pandoc by default, through
 `libxml-parse-html-region` + `shr-insert-document`. No HTTP servers,
 no websockets, no temporary output files.
 
-It was extracted from the ep3c Emacs configuration
-(https://github.com/diacus/ep3c, module `src/modules/markdown.org`),
-following the same pattern as https://github.com/diacus/shell-edit.el:
-the framework consumes the published package via quelpa and keeps only
-keybindings and display customization locally.
+It is an independent, single-file Emacs Lisp package, comparable to
+https://github.com/diacus/shell-edit.el, and is intended to be
+consumed from other configs and frameworks via quelpa, which then
+keep only keybindings and display customization locally.
 
 ## Layout
 
@@ -126,10 +125,6 @@ is the behavior being tested.
 
 - All public identifiers use the `native-md-preview` prefix; machinery
   is `native-md-preview--` (private).
-- The codebase is kept in sync with the ep3c module it came from
-  (bug fixes are backported to
-  `ep3c:src/modules/markdown.org` and vice versa) until publication.
 - checkdoc-clean: two spaces between sentences, quoted symbols in
   docstrings, imperative docstring verbs.
-- License: GPL-3.0-or-later (inherited from ep3c). Keep the SPDX and
-  GPL header on new files.
+- License: GPL-3.0-or-later. Keep the SPDX and GPL header on new files.
