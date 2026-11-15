@@ -1,0 +1,48 @@
+#+TITLE: native-md-preview.el
+
+Live Markdown preview rendered entirely inside Emacs — no HTTP
+servers, no websockets, no temporary output files.
+
+* How it works
+
+The buffer is converted to HTML by an external Markdown processor
+(=pandoc= by default, via =markdown-command=) and rendered in place
+with =libxml-parse-html-region= followed by =shr-insert-document=.
+
+* Features
+
+- Preview refreshes on a short debounce as you type; no need to save.
+- One preview buffer per document (=*native-md-preview:README.md*=),
+  so several documents can be previewed at the same time.
+- Bidirectional proportional scroll synchronization between source and
+  preview windows.
+- Styled output: minimal inline CSS, slightly nicer than naked =eww=.
+
+* Installation
+
+Not on a package archive yet; install from Git with quelpa:
+
+#+begin_src emacs-lisp
+  (use-package native-md-preview
+    :quelpa (native-md-preview :fetcher github :repo "diacus/native-md-preview.el"))
+#+end_src
+
+* Usage
+
+From a =markdown-mode= or =gfm-mode= buffer:
+
+#+begin_src emacs-lisp
+  (native-md-preview-toggle)
+#+end_src
+
+or =M-x native-md-preview-mode=.
+
+* Requirements
+
+- Emacs 28.1 or later compiled with libxml2 (=libxml2-available-p=).
+- =markdown-mode=.
+- A Markdown processor such as =pandoc= on the PATH.
+
+* License
+
+GPL-3.0. See [[file:LICENSE][LICENSE]].
