@@ -42,6 +42,11 @@
 ;;   be previewed at the same time.
 ;; - Bidirectional proportional scroll synchronization between the
 ;;   source buffer and the preview window.
+;; - Source code blocks are highlighted with the current theme's
+;;   font-lock faces.  The language set is whatever `markdown-command'
+;;   supports (`pandoc --list-highlight-languages' with the default
+;;   pandoc); fenced blocks with a language tag it does not know
+;;   render as plain unstyled code.
 ;;
 ;; Enable with `native-md-preview-mode' or `native-md-preview-toggle'
 ;; from a `markdown-mode' or `gfm-mode' buffer.
@@ -53,6 +58,7 @@
 
 (require 'markdown-mode)
 (require 'shr)
+(require 'color)
 
 (defgroup native-md-preview nil
   "Live markdown preview settings."
@@ -71,6 +77,61 @@ gets its own preview buffer, e.g. *native-md-preview:README.md*."
 (defcustom native-md-preview-debounce-time 0.3
   "Idle seconds before updating preview after a change."
   :type 'number
+  :group 'native-md-preview)
+
+(defcustom native-md-preview-token-faces
+  '(("kw" . font-lock-keyword-face)
+    ("cf" . font-lock-keyword-face)
+    ("im" . font-lock-keyword-face)
+    ("co" . font-lock-comment-face)
+    ("do" . font-lock-comment-face)
+    ("an" . font-lock-comment-face)
+    ("rm" . font-lock-comment-face)
+    ("cv" . font-lock-comment-face)
+    ("in" . font-lock-comment-face)
+    ("st" . font-lock-string-face)
+    ("ss" . font-lock-string-face)
+    ("vs" . font-lock-string-face)
+    ("ch" . font-lock-string-face)
+    ("sc" . font-lock-string-face)
+    ("dv" . font-lock-constant-face)
+    ("bn" . font-lock-constant-face)
+    ("fl" . font-lock-constant-face)
+    ("cn" . font-lock-constant-face)
+    ("at" . font-lock-constant-face)
+    ("fu" . font-lock-function-name-face)
+    ("va" . font-lock-variable-name-face)
+    ("dt" . font-lock-type-face)
+    ("op" . font-lock-builtin-face)
+    ("bu" . font-lock-builtin-face)
+    ("ot" . font-lock-builtin-face)
+    ("ex" . font-lock-builtin-face)
+    ("pp" . font-lock-preprocessor-face)
+    ("wa" . font-lock-warning-face)
+    ("al" . font-lock-warning-face)
+    ("er" . font-lock-warning-face))
+  "Mapping of pandoc syntax highlighting token classes to faces.
+Each element has the form (TOKEN-CLASS . FACE), where TOKEN-CLASS is
+one of the two-letter CSS classes pandoc emits around highlighted
+code tokens and FACE is the face whose foreground colors the token in
+the preview.
+
+Token classes not listed here are rendered with the default code
+color.  Set a class to nil to disable its highlighting.
+
+The mapping is resolved on every preview refresh, so changes to
+themes or faces take effect on the next re-render.
+
+Which languages receive highlighting at all, and how a fenced
+block's language tag selects a highlighter, is decided by
+`markdown-command'.  With the default pandoc, tags are matched
+against the exact canonical language name (e.g. \"python\", not
+\"py\"), tags unknown to the processor render as plain unstyled code,
+and the supported languages can be listed with
+\"pandoc --list-highlight-languages\"."
+  :type '(repeat (cons (string :tag "Token class")
+                       (choice (face :tag "Face")
+                               (const :tag "None" nil))))
   :group 'native-md-preview)
 
 ;; In source buffer: reference to preview buffer
@@ -127,11 +188,80 @@ image in the document)."
                      (or buffer-file-name default-directory)))))
     (url-encode-url (concat "file://" (expand-file-name dir)))))
 
+(defun native-md-preview--face-color (face)
+  "Return the foreground of FACE as an RGB hex string, or nil.
+Resolution follows the face's `:inherit' chain against the active
+theme.  A foreground already given as an #rrggbb string is returned
+verbatim, downcased; other color names are resolved with
+`color-name-to-rgb', which is exact on a real display.  Returns nil
+when the foreground is not a resolvable color, e.g. for faces left
+unspecified when no theme is loaded (batch mode)."
+  (let ((color (face-attribute face :foreground nil t)))
+    (when (and (stringp color)
+               (not (string-empty-p color)))
+      (or (and (string-match-p "^#[0-9a-fA-F]\\{6\\}$" color)
+               (downcase color))
+          (when-let* ((rgb (color-name-to-rgb color)))
+            (pcase-let ((`(,r ,g ,b) rgb))
+              (format "#%02x%02x%02x"
+                      (round (* 255 r))
+                      (round (* 255 g))
+                      (round (* 255 b)))))))))
+
+(defconst native-md-preview--token-span-regexp
+  "<span[[:space:]]+class=\"\\([a-z][a-z]\\)\">"
+  "Regexp matching a pandoc syntax highlighting token span.
+Pandoc emits one such span per token, always a bare two-letter
+skylighting class and no other attributes; longer classes (e.g.
+\"sourceCode\", \"math display\") never match and every non-code
+span class pandoc emits for prose is longer than two letters.
+Whitespace after \"span\" is allowed because pandoc wraps long
+lines even inside tags.")
+
+(defun native-md-preview--token-styles ()
+  "Compute token class to color mapping for the current theme.
+Returns an alist whose keys are pandoc token class strings and whose
+values are CSS style strings (e.g. \"color:#569cd6\"), derived from
+`native-md-preview-token-faces'.  Classes whose face has no
+resolvable foreground are skipped, so callers treat a missing entry
+as \"unstyled\"."
+  (let (styles)
+    (dolist (entry native-md-preview-token-faces)
+      (let ((class (car entry))
+            (face (cdr entry)))
+        (when-let* ((face face)
+                    (hex (native-md-preview--face-color face)))
+          (push (cons class (format "color:%s" hex)) styles))))
+    (nreverse styles)))
+
+(defun native-md-preview--highlight-code-tokens (html styles)
+  "Inject token colors from STYLES into the HTML string.
+Argument HTML is pandoc's HTML output; STYLES is the alist computed
+by `native-md-preview--token-styles'.  Every pandoc token span of a
+known class gets its color as an inline style attribute, the only
+span styling `shr-insert-document' honors.  Classes without an
+entry in STYLES are left untouched, and HTML without token spans
+(e.g. produced with --no-highlight, or by a markdown command other
+than pandoc) is returned unchanged."
+  (if (null styles)
+      html
+    (replace-regexp-in-string
+     native-md-preview--token-span-regexp
+     (lambda (match)
+       (let* ((class (match-string 1 match))
+              (style (cdr (assoc class styles))))
+         (if style
+             (format "<span class=\"%s\" style=\"%s\">" class style)
+           match)))
+     html t)))
+
 (defun native-md-preview--to-html ()
   "Convert current markdown buffer to HTML string.
 Wraps in minimal HTML structure for proper rendering, including a
 base element pointing at the buffer's location, so that shr expands
-relative image paths and links against the document's directory."
+relative image paths and links against the document's directory.
+Highlighted code token spans get inline color styles resolved from
+`native-md-preview-token-faces'."
   (let ((content (buffer-string))
         (cmd (if (boundp 'markdown-command) markdown-command "pandoc"))
         (base (native-md-preview--base-href)))
@@ -145,7 +275,9 @@ relative image paths and links against the document's directory."
               (call-process cmd nil t nil
                             "--from=gfm" "--to=html"
                             temp-file)
-              (let ((html (buffer-string)))
+              (let* ((html (native-md-preview--highlight-code-tokens
+                            (buffer-string)
+                            (native-md-preview--token-styles))))
                 ;; Wrap in HTML structure for better shr rendering
                 (format "<!DOCTYPE html>
 <html>

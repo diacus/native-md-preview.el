@@ -166,6 +166,156 @@ batch Emacs."
     (should (= (point) (point-min)))
     (should (string-match-p "rendered" (buffer-string)))))
 
+;;; Syntax highlighting
+
+;; Face resolution is theme-dependent; in batch no theme is loaded and
+;; font-lock faces report an `unspecified-fg' foreground sentinel.
+;; Tests stub explicit colors through the global face spec, which
+;; works headless, and restore whatever was there before (possibly the
+;; sentinel symbol itself, which `set-face-attribute' accepts back
+;; verbatim).
+
+(defun native-md-preview-test--with-faces (spec body-thunk)
+  "Stub face foregrounds from SPEC while calling BODY-THUNK.
+SPEC is a list of (FACE . COLOR) pairs.  The previous foreground of
+each FACE is restored afterwards, whatever its type."
+  (let ((saved nil))
+    (unwind-protect
+        (progn
+          (dolist (entry spec)
+            (let ((face (car entry)))
+              (push (cons face (face-attribute face :foreground nil t))
+                    saved))
+            (set-face-attribute (car entry) nil :foreground (cdr entry)))
+          (funcall body-thunk))
+      (dolist (entry saved)
+        (set-face-attribute (car entry) nil :foreground (cdr entry))))))
+
+(ert-deftest native-md-preview/highlight-code-tokens-injects-styles ()
+  (native-md-preview-test--with-faces
+   '((font-lock-keyword-face . "#569cd6")
+     (font-lock-comment-face . "#6a9955"))
+   (lambda ()
+     (should
+      (equal
+       (native-md-preview--highlight-code-tokens
+        "foo <span class=\"kw\">def</span> bar <span class=\"co\"># c</span>"
+        (native-md-preview--token-styles))
+       (concat "foo <span class=\"kw\" style=\"color:#569cd6\">def</span>"
+               " bar <span class=\"co\" style=\"color:#6a9955\"># c</span>"))))))
+
+(ert-deftest native-md-preview/highlight-code-tokens-unknown-class-untouched ()
+  (native-md-preview-test--with-faces
+   '((font-lock-keyword-face . "#569cd6"))
+   (lambda ()
+     (should
+      (equal
+       (native-md-preview--highlight-code-tokens
+        "<span class=\"zz\">x</span><span class=\"math inline\">y</span>"
+        (native-md-preview--token-styles))
+       "<span class=\"zz\">x</span><span class=\"math inline\">y</span>"))
+     ;; The --no-highlight shape: no token spans at all
+     (should
+      (equal
+       (native-md-preview--highlight-code-tokens
+        "<pre class=\"python\"><code>x = 1</code></pre>"
+        (native-md-preview--token-styles))
+       "<pre class=\"python\"><code>x = 1</code></pre>")))))
+
+(ert-deftest native-md-preview/highlight-code-tokens-adjacent-spans ()
+  (native-md-preview-test--with-faces
+   '((font-lock-string-face . "#ce9178")
+     (font-lock-constant-face . "#4fc1ff"))
+   (lambda ()
+     (should
+      (equal
+       (native-md-preview--highlight-code-tokens
+        "<span class=\"ss\">f\"</span><span class=\"dv\">1</span>"
+        (native-md-preview--token-styles))
+       (concat "<span class=\"ss\" style=\"color:#ce9178\">f\"</span>"
+               "<span class=\"dv\" style=\"color:#4fc1ff\">1</span>"))))))
+
+(ert-deftest native-md-preview/face-color-hex-and-named ()
+  (native-md-preview-test--with-faces
+   '((font-lock-keyword-face . "#c586c0")
+     (font-lock-string-face . "orchid"))
+   (lambda ()
+     (should (equal (native-md-preview--face-color 'font-lock-keyword-face)
+                    "#c586c0"))
+     (let ((rgb (native-md-preview--face-color 'font-lock-string-face)))
+       (should (stringp rgb))
+       (should (string-match-p "#[0-9a-f]\\{6\\}" rgb))))))
+
+(ert-deftest native-md-preview/face-color-unspecified-degrades ()
+  (native-md-preview-test--with-faces
+   '((font-lock-keyword-face . unspecified))
+   (lambda ()
+     (should (null (native-md-preview--face-color 'font-lock-keyword-face))))))
+
+(defconst native-md-preview-test--python-doc
+  "```python\nimport os\ndef foo(x):  # note\n    return \"s\" + str(1.5)\n```\n"
+  "Markdown document with a python fence for highlighting tests.")
+
+(ert-deftest native-md-preview/to-html-highlights-fenced-code ()
+  (skip-unless native-md-preview-test--pandoc)
+  ;; In batch no theme is loaded and every font-lock face resolves to
+  ;; an unspecified foreground, which previews as unstyled; stub the
+  ;; colors for the classes pandoc emits for this document.
+  (native-md-preview-test--with-faces
+   '((font-lock-keyword-face . "#569cd6")
+     (font-lock-comment-face . "#6a9955")
+     (font-lock-constant-face . "#4fc1ff"))
+   (lambda ()
+     (native-md-preview-test--with-source src
+       (with-current-buffer src
+         (erase-buffer)
+         (insert native-md-preview-test--python-doc)
+         (let ((html (native-md-preview--to-html)))
+           (should (string-match-p
+                    "<span class=\"kw\" style=\"color:#[0-9a-f]\\{6\\}\">def</span>"
+                    html))
+           (should (string-match-p
+                    "<span class=\"co\" style=\"color:#[0-9a-f]\\{6\\}\">"
+                    html))
+           (should (string-match-p
+                    "<span class=\"fl\" style=\"color:#[0-9a-f]\\{6\\}\">"
+                    html))
+           ;; Per-line spans and sourceCode containers stay unstyled
+           (should-not (string-match-p
+                        "<span id=\"cb[0-9]+-[0-9]+\" style=" html))
+           (should-not (string-match-p
+                        "<span class=\"sourceCode\" style=" html))
+           (should-not (string-match-p
+                        "class=\"sourceCode python\" style=" html))))))))
+
+(ert-deftest native-md-preview/to-html-plain-fence-unstyled ()
+  (skip-unless native-md-preview-test--pandoc)
+  (native-md-preview-test--with-faces
+   '((font-lock-keyword-face . "#569cd6"))
+   (lambda ()
+     (native-md-preview-test--with-source src
+       (with-current-buffer src
+         (erase-buffer)
+         (insert "```\nx = 1\n```\n")
+         (should-not (string-match-p
+                      "style=\"color:"
+                      (native-md-preview--to-html))))))))
+
+(ert-deftest native-md-preview/to-html-styles-when-disabled ()
+  (skip-unless native-md-preview-test--pandoc)
+  (native-md-preview-test--with-faces
+   '((font-lock-keyword-face . "#569cd6"))
+   (lambda ()
+     (native-md-preview-test--with-source src
+       (with-current-buffer src
+         (erase-buffer)
+         (insert native-md-preview-test--python-doc)
+         (should-not
+          (string-match-p
+           "style=\"color:"
+           (let ((native-md-preview-token-faces nil))
+             (native-md-preview--to-html)))))))))
+
 ;;; Enable / preview buffers
 
 (ert-deftest native-md-preview/enable-creates-per-document-preview ()

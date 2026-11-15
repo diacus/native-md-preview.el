@@ -16,7 +16,21 @@ with =libxml-parse-html-region= followed by =shr-insert-document=.
   so several documents can be previewed at the same time.
 - Bidirectional proportional scroll synchronization between source and
   preview windows.
+- Source code blocks are highlighted with the colors of the current
+  Emacs theme (=font-lock= faces).
 - Styled output: minimal inline CSS, slightly nicer than naked =eww=.
+
+** Which languages get highlighting
+
+The language set is whatever =markdown-command= supports. With the
+default pandoc this is the ~160 languages of its skylighting
+highlighter, matched against the exact canonical language name, e.g.
+=python= and not =py=, =commonlisp= and not =elisp=; list them with
+
+: pandoc --list-highlight-languages
+
+Fenced blocks whose language tag is unknown to the processor render
+as plain unstyled code.
 
 * Installation
 
