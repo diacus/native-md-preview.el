@@ -47,6 +47,10 @@
 ;;   supports (`pandoc --list-highlight-languages' with the default
 ;;   pandoc); fenced blocks with a language tag it does not know
 ;;   render as plain unstyled code.
+;; - Markdown tables are drawn as box-drawn grids in a fixed-pitch
+;;   face, honoring cell alignment.  Header rows are optionally shaded
+;;   through `native-md-preview-table-header-face'.  Shr's own table
+;;   rendering is available through `native-md-preview-table-renderer'.
 ;;
 ;; Enable with `native-md-preview-mode' or `native-md-preview-toggle'
 ;; from a `markdown-mode' or `gfm-mode' buffer.
@@ -134,6 +138,100 @@ and the supported languages can be listed with
                                (const :tag "None" nil))))
   :group 'native-md-preview)
 
+;; Table glyph styling.
+
+(defcustom native-md-preview-table-horizontal-line ?─
+  "Character used to draw the horizontal rules between table rows.
+Only used when `native-md-preview-table-renderer' is `shr'; the
+boxed-grid renderer draws its own rules.  Bound to
+`shr-table-horizontal-line' while the preview renders, so changes
+take effect on the next preview refresh.
+
+Set this to nil for no horizontal rules at all, which was the
+rendering before table styling was introduced.
+
+This setting is ignored when `native-md-preview-table-collapse' is
+non-nil: shr draws a collapsed table without any rulers."
+  :type '(choice (const :tag "None" nil) character)
+  :group 'native-md-preview)
+
+(defcustom native-md-preview-table-vertical-line ?│
+  "Character used to draw the vertical rules between table columns.
+The rule character draws as a continuous line with
+`native-md-preview-table-horizontal-line' and
+`native-md-preview-table-corner', boxing the columns.  Ignored when
+`native-md-preview-table-collapse' is non-nil.  Changes take effect
+on the next preview refresh."
+  :type 'character
+  :group 'native-md-preview)
+
+(defcustom native-md-preview-table-corner ?─
+  "Character used to draw the corners where table rules meet.
+Using the same character as `native-md-preview-table-horizontal-line'
+draws continuous full-width rules; any other character punctuates the
+rules with corners between the columns.  Ignored when
+`native-md-preview-table-collapse' is non-nil.  Changes take effect
+on the next preview refresh."
+  :type 'character
+  :group 'native-md-preview)
+
+(defcustom native-md-preview-table-header-face nil
+  "Face whose background shades the table header cells, if any.
+The face's `:background' is resolved against the active theme and
+injected into the header cells as an inline style.  The default nil
+leaves headers with the cell background.  Set it to a face with a
+background to shade every table's header row.  Resolution happens on
+every preview refresh, so changes to themes or faces take effect on
+the next re-render."
+  :type '(choice (const :tag "None" nil) face)
+  :group 'native-md-preview)
+
+(defcustom native-md-preview-table-collapse nil
+  "Whether table borders are collapsed, CSS style.
+Only used when `native-md-preview-table-renderer' is `shr'; the
+boxed-grid renderer draws its own rules.  When non-nil, every
+`table' element gets `border-collapse: collapse'
+injected as an inline style before rendering, and shr draws the table
+without cell separators or row rulers; when nil, tables are drawn
+with the characters from `native-md-preview-table-horizontal-line',
+`native-md-preview-table-vertical-line' and
+`native-md-preview-table-corner'.
+
+This setting takes precedence over the character settings: a
+collapsed table ignores them.  Tables that already specify
+`border-collapse' in their HTML are left untouched.  Changes take
+effect on the next preview refresh."
+  :type 'boolean
+  :group 'native-md-preview)
+
+;; In source buffer: reference to preview buffer
+(defvar-local native-md-preview--preview-buffer nil)
+
+;; In source buffer: reference to preview window
+(defvar-local native-md-preview--preview-window nil)
+
+;; In preview buffer: reference to source buffer
+(defvar-local native-md-preview--source-buffer nil)
+
+;; Timer for debounced updates
+(defvar-local native-md-preview--timer nil)
+
+;; Scroll-sync plumbing: hook fires during redisplay, and modifications
+;; made to another window during its redisplay pass only take effect on
+;; a LATER full redisplay - in practice when the user switches focus.
+;; So the hooks only record the scroll that needs mirroring; a
+;; zero-second timer applies it after the current redisplay, outside
+;; redisplay context.
+(defvar native-md-preview--pending-window nil
+  "Window whose scroll is waiting to be mirrored by the idle sync.")
+(defvar native-md-preview--pending-reverse nil
+  "Whether the pending scroll wants reverse (preview) mirroring.")
+(defvar native-md-preview--sync-timer nil
+  "Timer scheduled to apply the pending scroll sync.")
+
+;; Forward declaration: defined below by `define-minor-mode'
+(defvar native-md-preview-mode nil)
+
 ;; In source buffer: reference to preview buffer
 (defvar-local native-md-preview--preview-buffer nil)
 
@@ -188,15 +286,15 @@ image in the document)."
                      (or buffer-file-name default-directory)))))
     (url-encode-url (concat "file://" (expand-file-name dir)))))
 
-(defun native-md-preview--face-color (face)
-  "Return the foreground of FACE as an RGB hex string, or nil.
-Resolution follows the face's `:inherit' chain against the active
-theme.  A foreground already given as an #rrggbb string is returned
-verbatim, downcased; other color names are resolved with
-`color-name-to-rgb', which is exact on a real display.  Returns nil
-when the foreground is not a resolvable color, e.g. for faces left
-unspecified when no theme is loaded (batch mode)."
-  (let ((color (face-attribute face :foreground nil t)))
+(defun native-md-preview--face-color (face &optional attribute)
+  "Return foreground (or ATTRIBUTE) of FACE as an RGB hex string, or nil.
+ATTRIBUTE defaults to `:foreground'.  Resolution follows the face's
+`:inherit' chain against the active theme.  A color already given as
+an #rrggbb string is returned verbatim, downcased; other color names
+are resolved with `color-name-to-rgb', which is exact on a real
+display.  Returns nil when the color is not resolvable, e.g. for
+faces left unspecified when no theme is loaded (batch mode)."
+  (let ((color (face-attribute face (or attribute :foreground) nil t)))
     (when (and (stringp color)
                (not (string-empty-p color)))
       (or (and (string-match-p "^#[0-9a-fA-F]\\{6\\}$" color)
@@ -255,6 +353,286 @@ than pandoc) is returned unchanged."
            match)))
      html t)))
 
+(defconst native-md-preview--table-open-regexp
+  "<table\\([[:space:]][^>]*\\)?>"
+  "Regexp matching a `table' open tag with its attribute list.
+Group 1 holds the attributes and does not match at all for a bare
+`table' tag.  Whitespace or the closing bracket must follow
+\"table\" directly, so closing tags and other table-ish tags (e.g.
+\"<tablestyle>\") never match.  Only lowercase tag names match,
+which is what well-formed HTML output such as pandoc's emits.
+Attribute values containing a literal \">\" would truncate the
+match; well-formed HTML writers never emit those.")
+
+(defconst native-md-preview--th-open-regexp
+  "<th\\([[:space:]][^>]*\\)?>"
+  "Regexp matching a table header cell open tag.
+Group 1 holds the attributes and does not match at all for a bare
+`th' tag.  Same shape guarantees as
+`native-md-preview--table-open-regexp': closing and other `th'-ish
+tags (e.g. \"<thead>\") never match.")
+
+(defconst native-md-preview--tbody-tags-regexp
+  "</?\\(thead\\|tbody\\)>"
+  "Regexp matching table section wrappers.
+Pandoc wraps every table's header in `thead' and body in `tbody';
+without them shr nests sections into sub-tables when a table has a
+header row, which boxes the table twice.")
+
+(defun native-md-preview--flatten-tables (html)
+  "Remove `thead' and `tbody' wrappers from the tables in HTML.
+Argument HTML is pandoc's HTML output; the rows are left in place, so
+their cells keep their styling.  shr nests table sections into the
+sub-tables described in `native-md-preview--tbody-tags-regexp' to
+emulate browsers, boxing the table twice; without the wrappers it
+renders the rows directly.  HTML without section wrappers is returned
+unchanged."
+  (replace-regexp-in-string native-md-preview--tbody-tags-regexp "" html t))
+
+(defun native-md-preview--style-table-headers (html bg)
+  "Shade the table header cells of HTML with the background BG.
+Argument HTML is pandoc's HTML output; BG is a #rrggbb string from
+`native-md-preview--face-color', or nil for no styling.  Each header
+cell open tag gets the color injected as an inline style attribute,
+the only form of cell styling `shr-insert-document' honors; tags
+whose attributes already contain `background-color' are left
+untouched, and cells with a style attribute get the color appended to
+it.  HTML without header cells is returned unchanged, as is HTML when
+BG is nil."
+  (if (not bg)
+      html
+    (replace-regexp-in-string
+     native-md-preview--th-open-regexp
+     (lambda (tag)
+       ;; The lambda must leave the match data untouched: the caller's
+       ;; `replace-match' below still reads it, and this body's inner
+       ;; `string-match' on ATTRS would clobber it.
+       (save-match-data
+         (let ((attrs (match-string 1 tag))
+               (tail (format " style=\"background-color:%s\">" bg)))
+           (cond
+            ((null attrs)
+             (format "<th style=\"background-color:%s\">" bg))
+            ((string-match-p "background-color" attrs)
+             tag)
+            ((string-match "style=\"\\([^\"]*\\)\"" attrs)
+             (format "<th style=\"%s;background-color:%s\">"
+                     (string-remove-suffix
+                      ";" (string-trim-left (match-string 1 attrs)))
+                     bg))
+            (t
+             (concat "<th" attrs tail))))))
+     html t t)))
+
+(defcustom native-md-preview-table-renderer 'grid
+  "How tables are rendered in the preview.
+`grid' draws each table as its own box-drawn grid in a fixed-pitch
+face, with continuous rules, character-based column sizing and
+shaded header cells; `shr' falls back to shr's own pixel-based table
+machinery, which uses the table rule characters from
+`native-md-preview-table-horizontal-line' and friends and honors
+`native-md-preview-table-collapse' (with a header row, its emulation
+of browser behavior nests the sections, boxing the table twice).
+Changes take effect on the next preview refresh."
+  :type '(choice (const :tag "Box-drawn grid" grid)
+                 (const :tag "shr's table rendering" shr))
+  :group 'native-md-preview)
+;;; Scratch development of the boxed-grid table renderer -*- lexical-binding: t; -*-
+
+(require 'shr)
+(require 'color)
+
+(defun native-md-preview--table-rule (widths kind)
+  "Return a horizontal box-drawing rule for WIDTHS.
+KIND is the rule shape: `top', `middle' or `bottom'."
+  (let ((left (pcase kind ('top "┌") ('middle "├") (_ "└")))
+        (join (pcase kind ('top "┬") ('middle "┼") (_ "┴")))
+        (right (pcase kind ('top "┐") ('middle "┤") (_ "┘"))))
+    (concat left
+            (mapconcat
+             (lambda (width) (make-string (+ width 2) ?─))
+             widths join)
+            right)))
+
+(defun native-md-preview--table-cell (cell)
+  "Render CELL as a boxed grid table cell.
+CELL is a `td' or `th' DOM node.  Returns a list (LINES HEADER ALIGN
+BG), where LINES is the cell's content as strings carrying the face
+properties of the content, HEADER is non-nil for a `th' cell, ALIGN
+is the cell's `text-align' style value when the document specifies
+one, and BG is the cell's own `background-color' style value, if any."
+  (let* ((header (eq (dom-tag cell) 'th))
+         (style (shr-parse-style (dom-attr cell 'style)))
+         (align (cdr (assq 'text-align style)))
+         (bg (cdr (assq 'background-color style)))
+         (shr-fill-text nil)
+         lines)
+    (with-temp-buffer
+      (shr-descend (cons 'span (cons nil (dom-children cell))))
+      (goto-char (point-min))
+      (while (not (eobp))
+        (push (buffer-substring (line-beginning-position)
+                                (line-end-position))
+              lines)
+        (forward-line 1))
+      (setq lines (nreverse lines))
+      ;; Drop the blank lines shr leaves around paragraphs, but keep
+      ;; interior ones (from explicit line breaks).
+      (while (and lines (string-empty-p (string-trim (car lines))))
+        (pop lines))
+      (while (and lines (string-empty-p (string-trim (car (last lines)))))
+        (nbutlast lines)))
+    (list (or lines (list "")) header align bg)))
+
+(defun native-md-preview--table-rows (dom)
+  "Return GRID, the cell rows of table DOM, padded to a common width.
+Each GRID row is a list of cells as returned by `native-md-preview--table-cell'."
+  (let ((rows ()) ncols grid)
+    (dolist (row (dom-non-text-children dom))
+      (when (and (not (stringp row)) (eq (dom-tag row) 'tr))
+        (push (mapcar #'native-md-preview--table-cell
+                      (dom-non-text-children row))
+              rows)))
+    (setq grid (nreverse rows)
+          ncols (apply #'max (cons 1 (mapcar #'length grid))))
+    (dotimes (i (length grid))
+      (let ((row (nth i grid)))
+        (while (< (length row) ncols)
+          (setq row (append row (list (list (list "") nil nil nil)))))
+        (setcar (nthcdr i grid) row)))
+    grid))
+
+(defun native-md-preview--table-widths (grid)
+  "Compute the display width of each column of GRID.
+GRID is as returned by `native-md-preview--table-rows'.  Each column
+fits its widest cell line with one blank space on each side."
+  (let ((widths (make-vector (length (car grid)) 0)))
+    (dolist (row grid)
+      (dotimes (i (length row))
+        (dolist (line (car (nth i row)))
+          (aset widths i
+                (max (aref widths i) (string-width line))))))
+    widths))
+
+(defun native-md-preview--table-header-row-p (row)
+  "Whether every cell of ROW is a header cell.
+ROW is a list of cells as returned by `native-md-preview--table-cell'."
+  (and row
+       (not (member nil (mapcar (lambda (cell) (nth 1 cell)) row)))))
+
+(defun native-md-preview--table-pad (line width align)
+  "Pad LINE with spaces to WIDTH columns given ALIGN.
+ALIGN is nil, \"left\", \"center\" or \"right\"; one blank space
+buffers the text from the cell borders.  The result is two display
+characters wider than WIDTH."
+  (let* ((tw (string-width line))
+         (extra (max 0 (- width tw)))
+         (lpad (pcase align
+                 ("right" (make-string extra ?\s))
+                 ("center" (make-string (/ extra 2) ?\s))
+                 (_ "")))
+         (rpad (make-string (- extra (length lpad)) ?\s)))
+    ;; one buffer space at each side of the cell
+    (list (concat " " lpad line rpad " "))))
+
+(defun native-md-preview--table-stage (grid widths)
+  "Assemble GRID with WIDTHS in a temp buffer.
+Returns (TEXT HEADER-REGIONS): TEXT is the assembled box drawing
+carrying the face properties of cell contents, HEADER-REGIONS is a
+list of (BEG END COLOR) shading regions, positions relative to TEXT."
+  (with-temp-buffer
+    (let (header-regions)
+      (insert (native-md-preview--table-rule widths 'top) "\n")
+      (dotimes (i (length grid))
+        (let* ((row (nth i grid))
+               (row-lines (apply #'max (cons 1 (mapcar (lambda (c) (length (car c))) row)))))
+          (dotimes (l row-lines)
+            (progn
+              (dotimes (c (length widths))
+                (let* ((cell (nth c row))
+                       (bg (and (nth 1 cell) (nth 3 cell)))
+                       (line (or (nth l (car cell)) ""))
+                       (beg-cell (point)))
+                  (insert "│")
+                  (insert (mapconcat
+                           #'identity
+                           (native-md-preview--table-pad line (aref widths c) (nth 2 cell))
+                           ""))
+                  (when bg
+                    (push (list (1+ beg-cell) (point) bg) header-regions))))
+              (insert "│\n")))
+          (let ((next (and (< (1+ i) (length grid)) (nth (1+ i) grid))))
+            (when (and (native-md-preview--table-header-row-p row)
+                       (or (null next)
+                           (not (native-md-preview--table-header-row-p next))))
+              (insert (native-md-preview--table-rule widths 'middle) "\n")))))
+      (insert (native-md-preview--table-rule widths 'bottom) "\n")
+      (list (buffer-substring (point-min) (point))
+            (nreverse header-regions)))))
+
+(defun native-md-preview--table-render (dom)
+  "Render table DOM at point as a box-drawn grid.
+Bound to `shr-external-rendering-functions' for `table' tags when
+`native-md-preview-table-renderer' is `grid', in place of shr's own
+pixel-based table machinery, which nests rows in sections.  The whole
+grid is drawn in a fixed-pitch face so columns align, header cells get
+the background their HTML specifies, and cell content keeps the faces
+shr applied while rendering it inline.  The fixed-pitch face pins the
+default face's height as well as the family, otherwise the box
+drawing characters fall back to the family's default size while the
+cell text keeps the buffer's face height, and the columns drift."
+  (let* ((grid (native-md-preview--table-rows dom))
+         (widths (native-md-preview--table-widths grid))
+         (staged (native-md-preview--table-stage grid widths))
+         (beg (point))
+         (height (face-attribute 'default :height nil t))
+         (face (if (integerp height)
+                   (list :family "Monospace" :height height)
+                 '(:family "Monospace"))))
+    (insert (car staged))
+    (add-face-text-property beg (point) face nil)
+    (dolist (region (cadr staged))
+      (let ((pos (+ beg (car region))))
+        (add-face-text-property pos (+ beg (cadr region))
+                                (list :background (caddr region))
+                                nil
+                                nil)))))
+
+(defun native-md-preview--collapse-tables (html collapse)
+  "Inject `border-collapse: collapse' into every table in HTML.
+Argument HTML is pandoc's HTML output; COLLAPSE is the boolean
+`native-md-preview-table-collapse' read by the caller in the source
+buffer's context (a let-binding of a variable with a buffer-local
+value would itself be buffer-local, and thus invisible to this
+function's temp-buffer scope).  Each `table' open tag gets the CSS
+declaration injected as an inline style attribute, the only place
+`shr-insert-document' honors table styling; tags whose attributes
+already contain `border-collapse' are left untouched, and tables
+without a style attribute get one.  HTML without any `table' open tag
+is returned unchanged, as is HTML when COLLAPSE is nil."
+  (if (not collapse)
+      html
+    (replace-regexp-in-string
+     native-md-preview--table-open-regexp
+     (lambda (tag)
+       ;; The lambda must leave the match data untouched: the caller's
+       ;; `replace-match' below still reads it, and this body's inner
+       ;; `string-match' on ATTRS would clobber it.
+       (save-match-data
+         (let ((attrs (match-string 1 tag)))
+           (cond
+            ((null attrs)
+             "<table style=\"border-collapse: collapse\">")
+            ((string-match-p "border-collapse" attrs)
+             tag)
+            ((string-match "style=\"\\([^\"]*\\)\"" attrs)
+             (format "<table style=\"border-collapse: collapse;%s\">"
+                     (string-trim-left (match-string 1 attrs))))
+            (t
+             (concat "<table" attrs
+                     " style=\"border-collapse: collapse\">"))))))
+     html t t)))
+
 (defun native-md-preview--to-html ()
   "Convert current markdown buffer to HTML string.
 Wraps in minimal HTML structure for proper rendering, including a
@@ -264,7 +642,14 @@ Highlighted code token spans get inline color styles resolved from
 `native-md-preview-token-faces'."
   (let ((content (buffer-string))
         (cmd (if (boundp 'markdown-command) markdown-command "pandoc"))
-        (base (native-md-preview--base-href)))
+        (base (native-md-preview--base-href))
+        ;; Capture the table settings in this buffer's context for the
+        ;; transforms below, which run inside temp buffers.
+        (table-collapse native-md-preview-table-collapse)
+        (table-header-bg (when native-md-preview-table-header-face
+                           (native-md-preview--face-color
+                            native-md-preview-table-header-face
+                            :background))))
     ;; Use temp file for reliable pandoc input
     (let ((temp-file (make-temp-file "md-preview" nil ".md")))
       (unwind-protect
@@ -275,9 +660,14 @@ Highlighted code token spans get inline color styles resolved from
               (call-process cmd nil t nil
                             "--from=gfm" "--to=html"
                             temp-file)
-              (let* ((html (native-md-preview--highlight-code-tokens
-                            (buffer-string)
-                            (native-md-preview--token-styles))))
+              (let* ((html (native-md-preview--collapse-tables
+                            (native-md-preview--style-table-headers
+                             (native-md-preview--highlight-code-tokens
+                              (native-md-preview--flatten-tables
+                               (buffer-string))
+                              (native-md-preview--token-styles))
+                             table-header-bg)
+                            table-collapse)))
                 ;; Wrap in HTML structure for better shr rendering
                 (format "<!DOCTYPE html>
 <html>
@@ -308,8 +698,16 @@ Argument HTML is the HTML string to render.
 Parses HTML via `libxml-parse-html-region' and renders via
 `shr-insert-document' directly.  This avoids `shr-render-buffer' which
 calls `pop-to-buffer' and would create a new `*html*' buffer on every
-refresh, leaking buffers."
-  (let ((inhibit-read-only t))
+refresh, leaking buffers.  The table rule characters are let-bound
+from the `native-md-preview-table' customizable variables, so they
+apply at every render."
+  (let ((inhibit-read-only t)
+        (shr-table-horizontal-line native-md-preview-table-horizontal-line)
+        (shr-table-vertical-line native-md-preview-table-vertical-line)
+        (shr-table-corner native-md-preview-table-corner)
+        (shr-external-rendering-functions
+         (when (eq native-md-preview-table-renderer 'grid)
+           '((table . native-md-preview--table-render)))))
     (erase-buffer)
     (shr-insert-document
      (with-temp-buffer

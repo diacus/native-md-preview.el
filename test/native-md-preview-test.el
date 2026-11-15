@@ -316,6 +316,217 @@ each FACE is restored afterwards, whatever its type."
            (let ((native-md-preview-token-faces nil))
              (native-md-preview--to-html)))))))))
 
+;;; Tables
+
+(ert-deftest native-md-preview/style-table-headers-injects-bg ()
+  (should
+   (equal
+    (native-md-preview--style-table-headers "<th>Name</th>" "#ebebeb")
+    "<th style=\"background-color:#ebebeb\">Name</th>"))
+  (should
+   (equal
+    (native-md-preview--style-table-headers
+     "<th>A</th><th>B</th>" "#ebebeb")
+    (concat "<th style=\"background-color:#ebebeb\">A</th>"
+            "<th style=\"background-color:#ebebeb\">B</th>"))))
+
+(ert-deftest native-md-preview/style-table-headers-extends-style ()
+  ;; pandoc emits text-align styles on header cells
+  (should
+   (equal
+    (native-md-preview--style-table-headers
+     "<th style=\"text-align: center;\">C</th>" "#ebebeb")
+    "<th style=\"text-align: center;background-color:#ebebeb\">C</th>")))
+
+(ert-deftest native-md-preview/collapse-tables-bare-table ()
+  (should
+   (equal
+    (native-md-preview--collapse-tables
+     "<table><tr><td>1</td></tr></table>" t)
+    (concat "<table style=\"border-collapse: collapse\">"
+            "<tr><td>1</td></tr></table>"))))
+
+(ert-deftest native-md-preview/collapse-tables-extends-style ()
+  ;; Existing styles (pandoc grid/narrow tables) must not be clobbered
+  (should
+   (equal
+    (native-md-preview--collapse-tables "<table style=\"width: 56%\">" t)
+    "<table style=\"border-collapse: collapse;width: 56%\">")))
+
+(ert-deftest native-md-preview/collapse-tables-leaves-collapsed-untouched ()
+  (should
+   (equal
+    (native-md-preview--collapse-tables
+     "<table style=\"border-collapse: collapse\">" t)
+    "<table style=\"border-collapse: collapse\">")))
+
+(ert-deftest native-md-preview/collapse-tables-noop-when-disabled ()
+  (dolist (tag (list "<table>"
+                     "<table style=\"width: 56%\">"
+                     "<table style=\"border-collapse: collapse\">"))
+    (should (equal (native-md-preview--collapse-tables tag nil) tag))))
+
+(ert-deftest native-md-preview/collapse-tables-ignores-other-tags ()
+  (dolist (html (list "<td>x</td>" "<tablestyle>x</tablestyle>"
+                      "</table>" "<span class=\"kw\">def</span>"))
+    (should (equal (native-md-preview--collapse-tables html t) html))))
+
+(ert-deftest native-md-preview/collapse-tables-multiple-tables ()
+  (should
+   (equal
+    (native-md-preview--collapse-tables
+     "<table></table>text<table></table>" t)
+    (concat "<table style=\"border-collapse: collapse\"></table>"
+            "text"
+            "<table style=\"border-collapse: collapse\"></table>"))))
+
+(ert-deftest native-md-preview/render-html-table-rules-when-shr-renderer ()
+  (let ((native-md-preview-table-renderer 'shr)
+        (native-md-preview-table-horizontal-line ?─)
+        (native-md-preview-table-vertical-line ?│)
+        (native-md-preview-table-corner ?┼))
+    (with-temp-buffer
+      (native-md-preview--render-html
+       "<!DOCTYPE html><html><body>
+<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>
+</body></html>")
+      (should (string-match-p "─" (buffer-string)))
+      (should (string-match-p "│" (buffer-string)))
+      (should (string-match-p "┼" (buffer-string)))))
+  ;; The none setting restores the pre-styling line-free rendering
+  (let ((native-md-preview-table-renderer 'shr)
+        (native-md-preview-table-horizontal-line nil))
+    (with-temp-buffer
+      (native-md-preview--render-html
+       "<!DOCTYPE html><html><body>
+<table><tr><td>a</td><td>b</td></tr></table>
+</body></html>")
+      (should-not (string-match-p "─" (buffer-string))))))
+
+(ert-deftest native-md-preview/render-html-table-boxes-grid ()
+  (with-temp-buffer
+    (native-md-preview--render-html
+     "<!DOCTYPE html><html><body>
+<table><tr><th>Name</th><th>Age</th></tr>
+<tr><td>Alice</td><td>25</td></tr></table>
+</body></html>")
+    (let ((text (buffer-string)))
+      (should (string-match-p "┌" text))
+      (should (string-match-p "│ Name" text))
+      (should (string-match-p "├" text))
+      (should (string-match-p "└" text))
+      (should (string-match-p "Alice" text))
+      ;; No nested double boxing
+      (should-not (string-match-p "││" text)))))
+
+(defconst native-md-preview-test--table-doc
+  "| A | B |\n| --- | --- |\n| 1 | 2 |\n"
+  "Markdown document with a GFM pipe table for collapse tests.")
+
+(ert-deftest native-md-preview/to-html-collapses-gfm-table ()
+  (skip-unless native-md-preview-test--pandoc)
+  (native-md-preview-test--with-source src
+    (with-current-buffer src
+      (erase-buffer)
+      (insert native-md-preview-test--table-doc)
+      (let ((native-md-preview-table-collapse t))
+        (should (string-match-p
+                 "<table style=\"[^\"]*border-collapse: collapse\""
+                 (native-md-preview--to-html))))
+      (let ((native-md-preview-table-collapse nil))
+        (should (string-match-p
+                 "<table>"
+                 (native-md-preview--to-html)))))))
+
+;; Buffer-local values must be honored even though the transform runs
+;; inside temp buffers
+(ert-deftest native-md-preview/to-html-collapses-buffer-local-option ()
+  (skip-unless native-md-preview-test--pandoc)
+  (native-md-preview-test--with-source src
+    (with-current-buffer src
+      (erase-buffer)
+      (insert native-md-preview-test--table-doc)
+      (setq-local native-md-preview-table-collapse t)
+      (should (string-match-p
+               "border-collapse: collapse"
+               (native-md-preview--to-html))))))
+
+(ert-deftest native-md-preview/style-table-headers-ignores-others ()
+  (dolist (html (list "<td>a</td>" "<thead>" "<tr>"
+                      "<th style=\"background-color:#ccc\">x</th>"))
+    (should (equal (native-md-preview--style-table-headers html "#ebebeb")
+                   html)))
+  ;; nil BG: identity
+  (should (equal (native-md-preview--style-table-headers "<th>A</th>" nil)
+                 "<th>A</th>")))
+
+(defun native-md-preview-test--with-face-background (face color body-thunk)
+  "Stub the :background of FACE with COLOR while calling BODY-THUNK.
+The previous background is restored afterwards, whatever its type."
+  (let ((saved (face-attribute face :background nil t)))
+    (unwind-protect
+        (progn
+          (set-face-attribute face nil :background color)
+          (funcall body-thunk))
+      (set-face-attribute face nil :background saved))))
+
+(ert-deftest native-md-preview/face-color-background-attribute ()
+  (native-md-preview-test--with-face-background
+   'header-line "#e5e5e5"
+   (lambda ()
+     (should (equal (native-md-preview--face-color 'header-line :background)
+                    "#e5e5e5")))))
+
+;; Buffer-local header face values must be honored even though the
+;; transform runs inside temp buffers
+(ert-deftest native-md-preview/to-html-styles-gfm-table-headers ()
+  (skip-unless native-md-preview-test--pandoc)
+  ;; Headers are unshaded by default; the test enables the shading
+  (let ((native-md-preview-table-header-face 'header-line))
+    (native-md-preview-test--with-face-background
+     'header-line "#e5e5e5"
+     (lambda ()
+       (native-md-preview-test--with-source src
+         (with-current-buffer src
+           (erase-buffer)
+           (insert native-md-preview-test--table-doc)
+           (should (string-match-p
+                    "<th[^>]*style=\"[^\"]*background-color:#e5e5e5\""
+                    (native-md-preview--to-html)))))))))
+
+;; Headers ship unshaded: the default defcustom leaves the cells bare
+(ert-deftest native-md-preview/to-html-gfm-table-headers-unshaded ()
+  (skip-unless native-md-preview-test--pandoc)
+  (native-md-preview-test--with-source src
+    (with-current-buffer src
+      (erase-buffer)
+      (insert native-md-preview-test--table-doc)
+      (should-not (string-match-p
+                   "background-color"
+                   (native-md-preview--to-html))))))
+
+(ert-deftest native-md-preview/flatten-tables-removes-section-wrappers ()
+  (should
+   (equal
+    (native-md-preview--flatten-tables
+     "<table><thead><tr><th>A</th></tr></thead><tbody><tr><td>1</td></tr></tbody></table>")
+    "<table><tr><th>A</th></tr><tr><td>1</td></tr></table>"))
+  ;; Content without wrappers is untouched
+  (should
+   (equal
+    (native-md-preview--flatten-tables "<tr><td>1</td></tr>")
+    "<tr><td>1</td></tr>")))
+
+(ert-deftest native-md-preview/to-html-gfm-table-unsectioned ()
+  (skip-unless native-md-preview-test--pandoc)
+  (native-md-preview-test--with-source src
+    (with-current-buffer src
+      (erase-buffer)
+      (insert native-md-preview-test--table-doc)
+      (let ((html (native-md-preview--to-html)))
+        (should (string-match-p "<tr>" html))
+        (should-not (string-match-p "</?\\(thead\\|tbody\\)>" html))))))
+
 ;;; Enable / preview buffers
 
 (ert-deftest native-md-preview/enable-creates-per-document-preview ()

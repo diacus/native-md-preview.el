@@ -18,6 +18,14 @@ with =libxml-parse-html-region= followed by =shr-insert-document=.
   preview windows.
 - Source code blocks are highlighted with the colors of the current
   Emacs theme (=font-lock= faces).
+- Markdown tables are drawn as box-drawn grids (=┌─┬─┐) in a
+  fixed-pitch face, honoring cell alignment.  Header rows can
+  optionally be shaded by setting =native-md-preview-table-header-face=
+  to a face with a =:background=.  Setting
+  =native-md-preview-table-renderer= to =shr= falls back to shr's own
+  rendering, which is configurable with
+  =native-md-preview-table-horizontal-line= and friends and collapses
+  with =native-md-preview-table-collapse=.
 - Styled output: minimal inline CSS, slightly nicer than naked =eww=.
 
 ** Which languages get highlighting
