@@ -115,11 +115,26 @@ scheme:
                      (buffer-name source))))
     (format "%s:%s*" prefix suffix)))
 
+(defun native-md-preview--base-href ()
+  "Compute the base href for the current buffer's location.
+A file:// URL of the directory of the visited file, or of the
+buffer's default-directory for non-file buffers; nil when it cannot
+be determined.  shr uses the document's base element to expand
+relative image paths and links (which pandoc emits for every local
+image in the document)."
+  (when-let* ((dir (file-name-directory
+                    (directory-file-name
+                     (or buffer-file-name default-directory)))))
+    (url-encode-url (concat "file://" (expand-file-name dir)))))
+
 (defun native-md-preview--to-html ()
   "Convert current markdown buffer to HTML string.
-Wraps in minimal HTML structure for proper rendering."
+Wraps in minimal HTML structure for proper rendering, including a
+base element pointing at the buffer's location, so that shr expands
+relative image paths and links against the document's directory."
   (let ((content (buffer-string))
-        (cmd (if (boundp 'markdown-command) markdown-command "pandoc")))
+        (cmd (if (boundp 'markdown-command) markdown-command "pandoc"))
+        (base (native-md-preview--base-href)))
     ;; Use temp file for reliable pandoc input
     (let ((temp-file (make-temp-file "md-preview" nil ".md")))
       (unwind-protect
@@ -134,7 +149,7 @@ Wraps in minimal HTML structure for proper rendering."
                 ;; Wrap in HTML structure for better shr rendering
                 (format "<!DOCTYPE html>
 <html>
-<head><meta charset=\"utf-8\">
+<head><meta charset=\"utf-8\">%s
 <style>
 body { font-family: sans-serif; margin: 2em; line-height: 1.6; }
 h1, h2, h3 { margin-top: 1.5em; }
@@ -146,6 +161,11 @@ pre { background: #f5f5f5; padding: 1em; overflow-x: auto; }
 %s
 </body>
 </html>"
+                        ;; A local location gets a base element on its own
+                        ;; head line; a location-less buffer gets none.
+                        (if base
+                            (format "\n<base href=\"%s\">" base)
+                          "")
                         html))))
         (delete-file temp-file)))))
 
