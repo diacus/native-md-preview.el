@@ -490,6 +490,7 @@ Otherwise delete just the window."
   (setq native-md-preview--preview-buffer nil
         native-md-preview--preview-window nil))
 
+;;;###autoload
 (define-minor-mode native-md-preview-mode
   "Toggle live markdown preview mode.
 
@@ -510,6 +511,7 @@ Killing preview buffer disables this mode."
       (native-md-preview--enable)
     (native-md-preview--disable)))
 
+;;;###autoload
 (defun native-md-preview-toggle ()
   "Toggle native-md-preview for current buffer.
 
