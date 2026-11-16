@@ -494,6 +494,32 @@ The previous background is restored afterwards, whatever its type."
                     "<th[^>]*style=\"[^\"]*background-color:#e5e5e5\""
                     (native-md-preview--to-html)))))))))
 
+(ert-deftest native-md-preview/table-wrap-breaks-lines ()
+  (should
+   (equal (native-md-preview--table-wrap "abcdefghij klmnopqrstuvwxyz" 10)
+          '("abcdefghij" "klmnopqrst" "uvwxyz")))
+  ;; short line passed through
+  (should (equal (native-md-preview--table-wrap "abc" 10) '("abc")))
+  ;; breaking at spaces keeps words whole
+  (should
+   (equal (native-md-preview--table-wrap "aa bbb cc" 5) '("aa" "bbb" "cc"))))
+
+(ert-deftest native-md-preview/table-fit-wraps-to-avail ()
+  (let* ((grid (list
+                (list (list (list "Variable") nil nil nil)
+                      (list (list "Values") nil nil nil)
+                      (list (list "Effect") nil nil nil))
+                (list (list (list "g:kb_layout") nil nil nil)
+                      (list (list "'es', 'latam'") nil nil nil)
+                      (list (list "applies the Spanish or Latin American layout mappings on load") nil nil nil)))))
+    ;; a column as wide as the whole budget wraps its cells
+    (let* ((fit (native-md-preview--table-fit grid [10 10 58] 20))
+           (grid (car fit))
+           (widths (cdr fit)))
+      (should (<= (apply #'+ (append widths nil)) 16))
+      (should (> (length (car (nth 2 (nth 1 grid)))) 1))
+      ;; header, align and bg survive wrapping
+      (should (null (nth 1 (nth 0 (nth 0 grid))))))))
 ;; Headers ship unshaded: the default defcustom leaves the cells bare
 (ert-deftest native-md-preview/to-html-gfm-table-headers-unshaded ()
   (skip-unless native-md-preview-test--pandoc)

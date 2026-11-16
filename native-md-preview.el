@@ -62,6 +62,7 @@
 
 (require 'markdown-mode)
 (require 'shr)
+(require 'subr-x)
 (require 'color)
 
 (defgroup native-md-preview nil
@@ -440,6 +441,7 @@ Changes take effect on the next preview refresh."
 ;;; Scratch development of the boxed-grid table renderer -*- lexical-binding: t; -*-
 
 (require 'shr)
+(require 'subr-x)
 (require 'color)
 
 (defun native-md-preview--table-rule (widths kind)
@@ -520,6 +522,123 @@ ROW is a list of cells as returned by `native-md-preview--table-cell'."
   (and row
        (not (member nil (mapcar (lambda (cell) (nth 1 cell)) row)))))
 
+(defun native-md-preview--table-window-column-width ()
+  "Best-effort number of character columns of the preview window.
+Measures the window showing the rendered buffer when it is on some
+frame.  On a graphic display the pixel budget comes from the window
+body and is converted to columns using the advance of the grid's
+fixed-pitch face; measuring through the default face would make a
+window hold more columns than the wider grid font really fits, and
+the table would overflow its right margin."
+  (let* ((win (get-buffer-window (current-buffer) t))
+         (mono-spec
+          (let ((height (face-attribute 'default :height nil t)))
+            (if (integerp height)
+                (list :family "Monospace" :height height)
+              '(:family "Monospace"))))
+         (mono-advance
+          (or (ignore-errors
+                (and (window-live-p win)
+                     (string-pixel-width
+                      (propertize "─" 'face mono-spec))))
+              (ignore-errors (default-font-width))))
+         (cols
+          (cond ((and (window-live-p win)
+                      (numberp mono-advance)
+                      (> mono-advance 0))
+                 (max 20 (floor (/ (max 1 (- (window-body-width win t) 12))
+                                   mono-advance))))
+                ((window-live-p win)
+                 (max 20 (window-width win)))
+                ((display-graphic-p) nil)
+                (t (max 20 (frame-width))))))
+    (when cols cols)))
+
+(defun native-md-preview--table-wrap (line width)
+  "Break LINE into display columns of at most WIDTH.
+Word-wraps at blank spaces where possible, hard-breaks words wider
+than the column otherwise.  The returned pieces are substrings, so
+they keep the face properties of their source."
+  (let ((pieces nil) (rest line) done)
+    (while (not done)
+      (let* ((limit (min width (length rest)))
+             (cut -1)
+             piece)
+        ;; remember the last blank column within the limit
+        (dotimes (i limit)
+          (when (eq (aref rest i) ?\s)
+            (setq cut i)))
+        (cond
+         ;; word break, dropping the blank
+         ((and (> cut 0)
+               (<= (string-width (substring rest 0 cut)) width))
+          (setq piece (substring rest 0 cut)
+                rest (substring rest (1+ cut))))
+         ;; hard break, dropping one leading blank of the continuation
+         (t
+          (setq piece (substring rest 0 limit)
+                rest (substring rest limit)
+                rest (if (and (> (length rest) 0)
+                              (eq (aref rest 0) ?\s))
+                         (substring rest 1)
+                       rest))))
+        (setq pieces (cons piece pieces))
+        (when (or (<= (string-width rest) width)
+                  (string-empty-p rest))
+          (unless (string-empty-p rest)
+            (setq pieces (cons rest pieces)))
+          (setq done t))))
+    (nreverse pieces)))
+
+(defun native-md-preview--table-wrap-cell (cell width)
+  "Word-wrap the text lines of CELL to WIDTH display columns.
+CELL is as returned by `native-md-preview--table-cell'.  The result
+replaces the cell's lines; header, alignment and background are kept."
+  (let* ((lines (car cell))
+         (wrapped (mapcan (lambda (line)
+                            (native-md-preview--table-wrap line width))
+                          lines)))
+    (list (or wrapped (list "")) (nth 1 cell) (nth 2 cell) (nth 3 cell))))
+
+(defun native-md-preview--table-fit (grid widths avail)
+  "Wrap GRID to fit the columns AVAIL given the natural WIDTHS.
+Returns (NEW-GRID . NEW-WIDTHS).  When the whole table already fits,
+the input is returned unchanged: with the wrapping off, a wide table
+overflows the window and shr re-fills it by line, breaking the box.
+Columns are shrunk from the widest down until the sum of the column
+widths fits, then every cell is re-wrapped to its column."
+  (let* ((ncols (length widths))
+         (fixed (+ (* 2 ncols) (1+ ncols)))
+         (target (- avail fixed))
+         (widths
+          (copy-sequence widths))
+         (sum-widths (lambda ()
+                       (let ((s 0))
+                         (dotimes (i ncols)
+                           (setq s (+ s (aref widths i))))
+                         s))))
+    (if (or (null avail) (<= (funcall sum-widths) target))
+        (cons grid widths)
+      ;; Shrink the widest column repeatedly until we fit or every
+      ;; column is a single character wide.
+      (while (and (> (funcall sum-widths) target)
+                  (> (apply #'max (append widths nil)) 1))
+        (let ((widest 0))
+          (dotimes (i ncols)
+            (when (> (aref widths i) (aref widths widest))
+              (setq widest i)))
+          (aset widths widest (1- (aref widths widest)))))
+      (let ((new-grid
+             (mapcar (lambda (row)
+                       (let ((i 0) new-row)
+                         (dolist (cell row)
+                           (push (native-md-preview--table-wrap-cell
+                                  cell (aref widths i)) new-row)
+                           (setq i (1+ i)))
+                         (nreverse new-row)))
+                     grid)))
+        (cons new-grid widths)))))
+
 (defun native-md-preview--table-pad (line width align)
   "Pad LINE with spaces to WIDTH columns given ALIGN.
 ALIGN is nil, \"left\", \"center\" or \"right\"; one blank space
@@ -570,6 +689,16 @@ list of (BEG END COLOR) shading regions, positions relative to TEXT."
       (list (buffer-substring (point-min) (point))
             (nreverse header-regions)))))
 
+(defun native-md-preview--table-pixel-width (text)
+  "Return the pixel width the staged TEXT would display at.
+Measures every line with `string-pixel-width', which honors the face
+properties of the staged grid (its fixed-pitch family and pinned
+height), and returns the widest line."
+  (let ((max-px 0))
+    (dolist (line (split-string text "\n"))
+      (setq max-px (max max-px (string-pixel-width line))))
+    max-px))
+
 (defun native-md-preview--table-render (dom)
   "Render table DOM at point as a box-drawn grid.
 Bound to `shr-external-rendering-functions' for `table' tags when
@@ -580,10 +709,50 @@ the background their HTML specifies, and cell content keeps the faces
 shr applied while rendering it inline.  The fixed-pitch face pins the
 default face's height as well as the family, otherwise the box
 drawing characters fall back to the family's default size while the
-cell text keeps the buffer's face height, and the columns drift."
+cell text keeps the buffer's face height, and the columns drift.
+
+The table is fitted against the real rendered width: the staged cell
+text is measured with `string-pixel-width' against the window body's
+pixel budget, because a column count derived from the default face's
+advance is wider than the grid font's and makes the table overflow."
   (let* ((grid (native-md-preview--table-rows dom))
-         (widths (native-md-preview--table-widths grid))
+         (avail (native-md-preview--table-window-column-width))
+         (fit (native-md-preview--table-fit
+               grid (native-md-preview--table-widths grid) avail))
+         (grid (car fit))
+         (widths (cdr fit))
          (staged (native-md-preview--table-stage grid widths))
+         (win (get-buffer-window (current-buffer) t))
+         (budget (and (window-live-p win)
+                      (- (window-body-width win t) 8)))
+         (staged
+          (if (and budget
+                   (> (native-md-preview--table-pixel-width
+                      (car staged))
+                      budget))
+              (let* ((measure (native-md-preview--table-pixel-width
+                               (car staged)))
+                   (attempts 3))
+                (while (and (> attempts 0) budget measure
+                            (> measure budget))
+                  ;; scale the char budget by the real overshoot and
+                  ;; re-fit, then re-measure
+                  (setq avail (max 20
+                                   (floor (* avail
+                                             (/ (float budget)
+                                                measure))))
+                        fit (native-md-preview--table-fit
+                             (car fit) (cdr fit) avail)
+                        staged (native-md-preview--table-stage
+                                (car fit) (cdr fit))
+                        measure (native-md-preview--table-pixel-width
+                                 (car staged))
+                        attempts (1- attempts)))
+                (when (and measure (> measure budget))
+                  (native-md-preview--table-stage
+                   (car fit) (cdr fit)))
+                staged)
+            staged))
          (beg (point))
          (height (face-attribute 'default :height nil t))
          (face (if (integerp height)

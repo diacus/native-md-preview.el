@@ -19,7 +19,9 @@ with =libxml-parse-html-region= followed by =shr-insert-document=.
 - Source code blocks are highlighted with the colors of the current
   Emacs theme (=font-lock= faces).
 - Markdown tables are drawn as box-drawn grids (=┌─┬─┐) in a
-  fixed-pitch face, honoring cell alignment.  Header rows can
+  fixed-pitch face, honoring cell alignment; wide tables wrap their
+  cells to as many lines as needed to fit the preview window, so the
+  box never overflows.  Header rows can
   optionally be shaded by setting =native-md-preview-table-header-face=
   to a face with a =:background=.  Setting
   =native-md-preview-table-renderer= to =shr= falls back to shr's own
